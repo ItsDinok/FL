@@ -21,4 +21,4 @@ ENV PYTHONUNBUFFERED = 1\
 
 WORKDIR /workspace
 
-CMD["/bin/bash"]
+CMD ["/bin/bash"]
