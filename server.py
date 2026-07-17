@@ -1,72 +1,69 @@
 """
-Flower federated learning server for the Vision Transformer.
+Flower server for the high-forgetting DIL baseline.
 
-Run:
-    python server.py
-then start clients with client.py.
+NOTE: if you run clients with a nonzero --drift-lag, set DRIFT_LAG below
+to the same value so the schedule is extended to let lagging clients
+finish their final domain block.
 """
 
 import flwr as fl
-import torch
 from flwr.common import ndarrays_to_parameters
 
-# Reuse the model definition so server and clients stay in sync
-from client import build_model
+from client import (build_model, round_to_domain, ROUNDS_PER_DOMAIN,
+                    NUM_CLIENTS, DRIFT_LAG)
+from cifardata import NUM_DOMAINS, DOMAIN_NAMES
 
-NUM_ROUNDS = 5
-MIN_CLIENTS = 2          # minimum clients needed per round
-FRACTION_FIT = 1.0       # fraction of available clients sampled each round
+# Base blocks + extra rounds so the most-lagged client completes its sequence
+NUM_ROUNDS = ROUNDS_PER_DOMAIN * NUM_DOMAINS + DRIFT_LAG * (NUM_CLIENTS - 1)
+MIN_CLIENTS = NUM_CLIENTS
 
 
-def weighted_average(metrics):
-    """Aggregate client 'accuracy' metrics weighted by number of examples."""
-    total = sum(num_examples for num_examples, _ in metrics)
-    acc = sum(num_examples * m["accuracy"] for num_examples, m in metrics)
-    return {"accuracy": acc / total}
+def fit_config(server_round: int):
+    return {"server_round": server_round}
+
+
+def evaluate_config(server_round: int):
+    return {"server_round": server_round}
+
+
+def heterogeneous_weighted_average(metrics):
+    """Weighted average per key, over only the clients that reported it."""
+    sums, counts = {}, {}
+    for n, m in metrics:
+        for k, v in m.items():
+            sums[k] = sums.get(k, 0.0) + n * v
+            counts[k] = counts.get(k, 0) + n
+    return {k: sums[k] / counts[k] for k in sorted(sums)}
 
 
 def get_initial_parameters():
-    """Initialize global weights from the (pretrained) ViT so all clients
-    start from the same point."""
     model = build_model()
-    ndarrays = [v.cpu().numpy() for v in model.state_dict().values()]
-    return ndarrays_to_parameters(ndarrays)
-
-
-# ----------------------------------------------------------------------------
-# OPTIONAL: centralized (server-side) evaluation
-# <<< PLUG IN a held-out test set here if you have one on the server. >>>
-# ----------------------------------------------------------------------------
-# def get_evaluate_fn():
-#     from client import MyDataset, evaluate  # your dataset class
-#     from torch.utils.data import DataLoader
-#
-#     test_set = MyDataset("data/server_test", train=False)   # <-- your path
-#     test_loader = DataLoader(test_set, batch_size=32)
-#     model = build_model()
-#
-#     def evaluate_fn(server_round, parameters, config):
-#         from collections import OrderedDict
-#         keys = model.state_dict().keys()
-#         model.load_state_dict(
-#             OrderedDict({k: torch.tensor(v) for k, v in zip(keys, parameters)})
-#         )
-#         loss, accuracy = evaluate(model, test_loader)
-#         return loss, {"accuracy": accuracy}
-#
-#     return evaluate_fn
+    return ndarrays_to_parameters(
+        [v.cpu().numpy() for v in model.state_dict().values()]
+    )
 
 
 def main():
+    print(f"Drift lag: {DRIFT_LAG} "
+          f"({'fully correlated - max forgetting' if DRIFT_LAG == 0 else 'staggered'})")
+    print("Per-client domain by round:")
+    for r in range(1, NUM_ROUNDS + 1):
+        domains = [DOMAIN_NAMES[round_to_domain(r, c, DRIFT_LAG)]
+                   for c in range(NUM_CLIENTS)]
+        print(f"  round {r:2d}: " + " | ".join(
+            f"c{c}={d}" for c, d in enumerate(domains)))
+
     strategy = fl.server.strategy.FedAvg(
-        fraction_fit=FRACTION_FIT,
+        fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=MIN_CLIENTS,
         min_evaluate_clients=MIN_CLIENTS,
         min_available_clients=MIN_CLIENTS,
         initial_parameters=get_initial_parameters(),
-        evaluate_metrics_aggregation_fn=weighted_average,
-        # evaluate_fn=get_evaluate_fn(),   # uncomment for server-side evaluation
+        on_fit_config_fn=fit_config,
+        on_evaluate_config_fn=evaluate_config,
+        evaluate_metrics_aggregation_fn=heterogeneous_weighted_average,
+        fit_metrics_aggregation_fn=heterogeneous_weighted_average,
     )
 
     fl.server.start_server(
