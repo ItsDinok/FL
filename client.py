@@ -1,30 +1,24 @@
 """
-Flower client for domain-incremental federated continual learning,
-configured to produce PRONOUNCED forgetting (baseline for
-forgetting-prevention research).
+Flower client for heterogeneous Dirichlet class-distribution federated
+continual learning with a Vision Transformer.
 
-Key knobs:
-  DRIFT_LAG    rounds by which client cid's drift lags client 0.
-               0  = fully correlated drift (max forgetting; all clients
-                    leave a domain at the same time, so nothing keeps it
-                    alive in aggregation)
-               ROUNDS_PER_DOMAIN = fully staggered (implicit replay,
-                    minimal forgetting — the regime from the previous run)
-               Sweep 0..ROUNDS_PER_DOMAIN to get forgetting-vs-drift-
-               correlation as a controlled axis.
-  LEARNING_RATE / LOCAL_EPOCHS
-               hotter optimization -> the model moves further toward the
-               current domain each block -> more overwriting of old ones.
+Each client independently resamples from Dir(ALPHA * 1_K) every block.
+Evaluation reports per-class accuracy for all 10 CIFAR-10 classes so
+class-level forgetting is visible round by round.
 
-All clients share the same domain ORDER (clean -> rotate -> permute ->
-noise); heterogeneity is in the TIMING via DRIFT_LAG. Per-client metrics
-(c{cid}_acc_*) and per-round CSV logging are unchanged.
+Outputs per client:
+  logs/metrics_client{cid}.csv    — per-class accuracy each round
+  logs/distribution_client{cid}.csv — Dirichlet proportions per block
+  logs/preflight_client{cid}.csv  — pre-training gradient signals
 """
 
 import argparse
 import csv
 import os
+import warnings
 from collections import OrderedDict
+
+warnings.filterwarnings("ignore", message=".*cudnnException.*")
 
 import flwr as fl
 import torch
@@ -32,19 +26,22 @@ import torch.nn as nn
 from torchvision.models import vit_b_16, ViT_B_16_Weights
 
 import cifardata
-from cifardata import NUM_DOMAINS, DOMAIN_NAMES
+from cifardata import (NUM_CLASSES, CLASS_NAMES,
+                       get_block_distribution,
+                       load_dirichlet_partition,
+                       load_per_class_eval_loaders)
 from preflight import Preflight
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NUM_CLASSES = 10
-NUM_CLIENTS = 3            # must match how many client processes you launch
-LOCAL_EPOCHS = 2           # was 1: more steps per block -> more forgetting
-LEARNING_RATE = 1e-4       # was 3e-5: hotter -> more overwriting
-ROUNDS_PER_DOMAIN = 5      # keep in sync with server.py
-DRIFT_LAG = 0              # 0 = correlated drift (max forgetting)
-PREFLIGHT_ENABLED = True   # assess batch impact before each round's training
-METRICS_DIR = "logs"
+NUM_CLIENTS        = 3
+LOCAL_EPOCHS       = 2
+LEARNING_RATE      = 1e-4
+ROUNDS_PER_BLOCK   = 5
+NUM_BLOCKS         = 4
+ALPHA              = 0.5    # 0.1 is pathologically sparse at K=100 classes
+PREFLIGHT_ENABLED  = True
+METRICS_DIR        = "logs"
 
 
 def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
@@ -53,176 +50,189 @@ def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
     return model.to(DEVICE)
 
 
-def round_to_domain(server_round: int, cid: int,
-                    drift_lag: int = DRIFT_LAG) -> int:
-    """All clients traverse the same domain sequence; client cid starts
-    each block `cid * drift_lag` rounds later. With drift_lag=0 every
-    client is always on the same domain (fully correlated drift)."""
-    effective_round = max(server_round - cid * drift_lag, 1)
-    block = min((effective_round - 1) // ROUNDS_PER_DOMAIN, NUM_DOMAINS - 1)
-    return block   # base order is 0,1,2,3 so block index == domain id
+def round_to_block(server_round: int) -> int:
+    return min((server_round - 1) // ROUNDS_PER_BLOCK, NUM_BLOCKS - 1)
 
 
 def train(model, loader, epochs: int):
     model.train()
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    for _ in range(epochs):
-        for images, labels in loader:
+    for ep in range(epochs):
+        for i, (images, labels) in enumerate(loader):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
             loss = criterion(model(images), labels)
             loss.backward()
             optimizer.step()
+            if i % 50 == 0:
+                print(f"  ep{ep+1} batch {i}/{len(loader)} "
+                      f"loss={loss.item():.3f}", flush=True)
 
 
-def evaluate(model, loader):
+def eval_loader(model, loader):
     model.eval()
     criterion = nn.CrossEntropyLoss()
     loss, correct, total = 0.0, 0, 0
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            loss += criterion(outputs, labels).item() * labels.size(0)
-            correct += (outputs.argmax(dim=1) == labels).sum().item()
+            out = model(images)
+            loss += criterion(out, labels).item() * labels.size(0)
+            correct += (out.argmax(1) == labels).sum().item()
             total += labels.size(0)
     return loss / total, correct / total
 
 
-class ContinualViTClient(fl.client.NumPyClient):
-    def __init__(self, cid: int, drift_lag: int):
-        self.cid = cid
-        self.drift_lag = drift_lag
+class DirichletCLClient(fl.client.NumPyClient):
+    def __init__(self, cid: int, alpha: float):
+        self.cid   = cid
+        self.alpha = alpha
         self.model = build_model()
         self._loader_cache = {}
-        self.eval_loaders = cifardata.load_all_domain_eval_loaders(
-            cid, NUM_CLIENTS
-        )
-        print(f"[client {cid}] drift_lag={drift_lag} "
-              f"(starts each block {cid * drift_lag} rounds after client 0)",
-              flush=True)
+        self.eval_loaders  = load_per_class_eval_loaders(samples_per_class=100)
 
         os.makedirs(METRICS_DIR, exist_ok=True)
+
+        # print startup schedule
+        print(f"[client {cid}] CIFAR-10 class distribution experiment  "
+              f"alpha={alpha}", flush=True)
+        for b in range(NUM_BLOCKS):
+            p = get_block_distribution(cid, alpha, b)
+            top3 = sorted(range(NUM_CLASSES), key=lambda c: -p[c])[:3]
+            print(f"  block {b}: "
+                  + ", ".join(f"{CLASS_NAMES[c]}={p[c]:.2f}" for c in top3),
+                  flush=True)
+
+        # distribution CSV (written once at startup)
+        dist_csv = os.path.join(METRICS_DIR, f"distribution_client{cid}.csv")
+        if not os.path.exists(dist_csv):
+            with open(dist_csv, "w", newline="") as f:
+                csv.writer(f).writerow(
+                    ["block", "dominant_class"]
+                    + [f"p_{n}" for n in CLASS_NAMES])
+            for b in range(NUM_BLOCKS):
+                p = get_block_distribution(cid, alpha, b)
+                with open(dist_csv, "a", newline="") as f:
+                    csv.writer(f).writerow(
+                        [b, CLASS_NAMES[int(p.argmax())]]
+                        + [f"{v:.4f}" for v in p])
+
+        # per-round metrics CSV
         self.csv_path = os.path.join(METRICS_DIR, f"metrics_client{cid}.csv")
         if not os.path.exists(self.csv_path):
             with open(self.csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["round", "trained_domain", "loss"]
-                                + [f"acc_{name}" for name in DOMAIN_NAMES]
-                                + ["acc_mean"])
-        self._last_trained_domain = None
-
-        # ---- preflight: assess incoming data BEFORE training on it ----
-        self.preflight = Preflight(self.model, lr=LEARNING_RATE, seed=cid) \
-            if PREFLIGHT_ENABLED else None
-        self.preflight_csv = os.path.join(
-            METRICS_DIR, f"preflight_client{cid}.csv")
-        if PREFLIGHT_ENABLED and not os.path.exists(self.preflight_csv):
-            with open(self.preflight_csv, "w", newline="") as f:
                 csv.writer(f).writerow(
-                    ["round", "incoming_domain", "cos_conflict",
-                     "inner_prod", "pred_dL_old_1st", "fisher_overlap",
-                     "curvature_term", "new_loss", "new_entropy",
-                     "ref_loss"])
+                    ["round", "block", "dominant_class", "loss"]
+                    + [f"acc_{n}" for n in CLASS_NAMES]
+                    + ["acc_mean"])
 
-    def _loaders_for_domain(self, domain_id: int):
-        if domain_id not in self._loader_cache:
-            self._loader_cache[domain_id] = cifardata.load_domain_partition(
-                self.cid, NUM_CLIENTS, domain_id
-            )
-        return self._loader_cache[domain_id]
+        # preflight
+        self.preflight = (Preflight(self.model, lr=LEARNING_RATE, seed=cid)
+                          if PREFLIGHT_ENABLED else None)
+        self.pf_csv = os.path.join(METRICS_DIR, f"preflight_client{cid}.csv")
+        if PREFLIGHT_ENABLED and not os.path.exists(self.pf_csv):
+            with open(self.pf_csv, "w", newline="") as f:
+                csv.writer(f).writerow(
+                    ["round", "block", "dominant_class",
+                     "cos_conflict", "inner_prod", "pred_dL_old_1st",
+                     "fisher_overlap", "curvature_term",
+                     "new_loss", "new_entropy", "ref_loss"])
+
+    def _loaders(self, block: int):
+        if block not in self._loader_cache:
+            self._loader_cache[block] = load_dirichlet_partition(
+                self.cid, NUM_CLIENTS, self.alpha, block)
+        return self._loader_cache[block]
 
     def get_parameters(self, config):
         return [v.cpu().numpy() for v in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
         keys = self.model.state_dict().keys()
-        state_dict = OrderedDict(
-            {k: torch.tensor(v) for k, v in zip(keys, parameters)}
-        )
-        self.model.load_state_dict(state_dict, strict=True)
+        self.model.load_state_dict(OrderedDict(
+            {k: torch.tensor(v) for k, v in zip(keys, parameters)}),
+            strict=True)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         server_round = int(config.get("server_round", 1))
-        domain = round_to_domain(server_round, self.cid, self.drift_lag)
-        self._last_trained_domain = domain
-        print(f"[client {self.cid}] round {server_round}: training on "
-              f"domain {domain} ({DOMAIN_NAMES[domain]})", flush=True)
+        block        = round_to_block(server_round)
+        p            = get_block_distribution(self.cid, self.alpha, block)
+        dominant     = CLASS_NAMES[int(p.argmax())]
 
-        train_loader, _ = self._loaders_for_domain(domain)
+        print(f"[client {self.cid}] round {server_round} block {block} "
+              f"dominant={dominant}({p.max():.2f})", flush=True)
 
-        fit_metrics = {f"c{self.cid}_trained_domain": domain}
+        train_loader, _ = self._loaders(block)
+        fit_metrics = {f"c{self.cid}_block": block}
+
         if self.preflight is not None:
             planned = LOCAL_EPOCHS * len(train_loader)
-            report = self.preflight.assess(train_loader, planned_steps=planned)
+            report  = self.preflight.assess(train_loader, planned_steps=planned)
             print(f"[client {self.cid}] preflight: "
-                  f"cos={report['cos_conflict']:.3f} "
-                  f"pred_dL_old={report['pred_dL_old_1st']:.3f} "
+                  f"cos={report['cos_conflict']:.3f}  "
+                  f"pred_dL={report['pred_dL_old_1st']:.4f}  "
                   f"new_loss={report['new_loss']:.3f}", flush=True)
-            with open(self.preflight_csv, "a", newline="") as f:
+            with open(self.pf_csv, "a", newline="") as f:
                 csv.writer(f).writerow(
-                    [server_round, DOMAIN_NAMES[domain]]
+                    [server_round, block, dominant]
                     + [f"{report[k]:.6f}" for k in
                        ("cos_conflict", "inner_prod", "pred_dL_old_1st",
-                        "fisher_overlap", "curvature_term", "new_loss",
-                        "new_entropy", "ref_loss")])
-            for k in ("cos_conflict", "pred_dL_old_1st", "new_loss"):
-                if report[k] == report[k]:   # skip NaN (round 1)
-                    fit_metrics[f"c{self.cid}_pf_{k}"] = float(report[k])
+                        "fisher_overlap", "curvature_term",
+                        "new_loss", "new_entropy", "ref_loss")])
+            for k in ("cos_conflict", "pred_dL_old_1st"):
+                v = report[k]
+                if v == v:
+                    fit_metrics[f"c{self.cid}_pf_{k}"] = float(v)
 
         train(self.model, train_loader, epochs=LOCAL_EPOCHS)
 
         if self.preflight is not None:
-            # fold the just-trained domain into the reference distribution
             self.preflight.update_buffer(train_loader.dataset, n=128)
 
-        return (self.get_parameters(config={}),
-                len(train_loader.dataset),
-                fit_metrics)
+        return self.get_parameters({}), len(train_loader.dataset), fit_metrics
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         server_round = int(config.get("server_round", 0))
+        block        = round_to_block(server_round) if server_round else 0
+        p            = get_block_distribution(self.cid, self.alpha, block)
+        dominant     = CLASS_NAMES[int(p.argmax())]
 
-        per_domain, total_loss, total_n = {}, 0.0, 0
-        for d, loader in self.eval_loaders.items():
-            loss, acc = evaluate(self.model, loader)
-            per_domain[d] = float(acc)
+        per_class, total_loss, total_n = {}, 0.0, 0
+        for c, loader in self.eval_loaders.items():
+            loss, acc = eval_loader(self.model, loader)
+            per_class[c] = float(acc)
             n = len(loader.dataset)
             total_loss += loss * n
-            total_n += n
-        mean_loss = total_loss / total_n
-        mean_acc = sum(per_domain.values()) / len(per_domain)
+            total_n    += n
 
-        metrics = {f"c{self.cid}_acc_{DOMAIN_NAMES[d]}": a
-                   for d, a in per_domain.items()}
+        mean_loss = total_loss / total_n
+        mean_acc  = sum(per_class.values()) / NUM_CLASSES
+
+        # per-client metric keys so server history keeps clients separate
+        metrics = {f"c{self.cid}_acc_{CLASS_NAMES[c]}": a
+                   for c, a in per_class.items()}
         metrics[f"c{self.cid}_acc_mean"] = float(mean_acc)
-        metrics["accuracy"] = float(mean_acc)
+        metrics["accuracy"]              = float(mean_acc)
 
         with open(self.csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            trained = (DOMAIN_NAMES[self._last_trained_domain]
-                       if self._last_trained_domain is not None else "")
-            writer.writerow([server_round, trained, f"{mean_loss:.4f}"]
-                            + [f"{per_domain[d]:.4f}"
-                               for d in range(NUM_DOMAINS)]
-                            + [f"{mean_acc:.4f}"])
+            csv.writer(f).writerow(
+                [server_round, block, dominant, f"{mean_loss:.4f}"]
+                + [f"{per_class[c]:.4f}" for c in range(NUM_CLASSES)]
+                + [f"{mean_acc:.4f}"])
 
         return float(mean_loss), total_n, metrics
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cid", type=int, required=True)
-    parser.add_argument("--server", type=str, default="127.0.0.1:8080")
-    parser.add_argument("--drift-lag", type=int, default=DRIFT_LAG,
-                        help="rounds by which client cid lags client 0's "
-                             "drift (0 = fully correlated, max forgetting)")
+    parser.add_argument("--cid",   type=int,   required=True)
+    parser.add_argument("--server",type=str,   default="127.0.0.1:8080")
+    parser.add_argument("--alpha", type=float, default=ALPHA)
     args = parser.parse_args()
-
     fl.client.start_client(
         server_address=args.server,
-        client=ContinualViTClient(args.cid, args.drift_lag).to_client(),
+        client=DirichletCLClient(args.cid, args.alpha).to_client(),
     )
