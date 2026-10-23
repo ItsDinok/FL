@@ -2,7 +2,7 @@
 horizon.py — prediction-horizon (delta-t) analysis for the intervention-
 signal benchmark. Run OFFLINE on the CSVs produced by a benchmark run.
 
-Definitions:
+Definitions (per supervisor spec):
     t_signal : first round where a signal exceeds its detection threshold
     t_forget : first round where a retained task's accuracy falls more
                than FORGET_DROP below its running maximum
@@ -85,9 +85,11 @@ def fleet_series(store, col):
     return {rd: sum(vs) / len(vs) for rd, vs in sorted(acc.items())}
 
 
-def find_t_forget(metrics, num_tasks, rounds_per_task):
+def find_t_forget(metrics, num_tasks, rounds_per_task, tau=None):
     """Per task: first round its retained accuracy drops FORGET_DROP below
     its running max, restricted to rounds AFTER the task finished training."""
+    if tau is None:
+        tau = FORGET_DROP
     events = {}
     for t in range(num_tasks):
         series = fleet_series(metrics, f"acc_task{t}")
@@ -95,7 +97,7 @@ def find_t_forget(metrics, num_tasks, rounds_per_task):
         run_max, t_forget = -1.0, None
         for rd, acc in series.items():
             run_max = max(run_max, acc)
-            if rd > task_end and acc < run_max - FORGET_DROP:
+            if rd > task_end and acc < run_max - tau:
                 t_forget = rd
                 break
         if t_forget is not None:
@@ -103,7 +105,7 @@ def find_t_forget(metrics, num_tasks, rounds_per_task):
     return events
 
 
-def find_class_events(metrics, logs_dir, rounds_per_task):
+def find_class_events(metrics, logs_dir, rounds_per_task, tau=None):
     """Class-migration mode: per-CLASS forgetting events.
 
     A class's effective 'task end' is the last round of the last block in
@@ -114,6 +116,8 @@ def find_class_events(metrics, logs_dir, rounds_per_task):
     events per class; each is scored independently.
     Returns {(class_name, event_idx): (effective_end_round, t_forget)}.
     """
+    if tau is None:
+        tau = FORGET_DROP
     # class columns from the metrics CSVs
     first = next(iter(metrics.values()))
     class_cols = [k for k in first[0] if k.startswith("acc_")
@@ -149,14 +153,14 @@ def find_class_events(metrics, logs_dir, rounds_per_task):
         run_max, idx, in_event = -1.0, 0, False
         for rd, acc in series.items():
             run_max = max(run_max, acc)
-            dropped = rd > eff_end and acc < run_max - FORGET_DROP
+            dropped = rd > eff_end and acc < run_max - tau
             if dropped and not in_event:
                 events[(cls, idx)] = (eff_end, rd)
                 idx += 1
                 in_event = True
             elif not dropped:
                 in_event = False
-                if acc >= run_max - FORGET_DROP / 2:
+                if acc >= run_max - tau / 2:
                     run_max = acc   # reset baseline after recovery
     return events
 
@@ -208,6 +212,12 @@ def main():
                          "class: class-migration (per-class acc_* columns "
                          "+ distribution_client*.csv)")
     ap.add_argument("--out", default="horizon_table.csv")
+    ap.add_argument("--tau-sweep", type=float, nargs="*", default=None,
+                    help="forgetting thresholds to sweep, e.g. "
+                         "--tau-sweep 0.03 0.05 0.08 0.10 (bare --tau-sweep "
+                         "uses that default list); writes <out>_tau.csv and "
+                         "reports how the event set and the signal ranking "
+                         "move with tau")
     ap.add_argument("--sweep", type=float, nargs="*", default=None,
                     help="z-score thresholds to sweep, e.g. "
                          "--sweep 1.5 2 2.5 3 4 5 (bare --sweep uses that "
@@ -216,6 +226,8 @@ def main():
     args = ap.parse_args()
     if args.sweep is not None and len(args.sweep) == 0:
         args.sweep = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    if args.tau_sweep is not None and len(args.tau_sweep) == 0:
+        args.tau_sweep = [0.03, 0.05, 0.08, 0.10]
 
     metrics = read_csvs(os.path.join(args.logs, "metrics_client*.csv"))
     signals = read_csvs(os.path.join(args.logs, "signals_client*.csv"))
@@ -269,6 +281,47 @@ def main():
               f"{s['det_rate']:>10.0%}{s['false_alarms']:>5}{cost:>11}")
     print("\nNote: cost (ms) is the wall-clock of the signal's GROUP "
           "(grad/perf/weight/repr), shared across signals in that group.")
+
+    # tau sweep: how sensitive are the event set and the ranking to the
+    # definition of a forgetting event?
+    if args.tau_sweep:
+        tau_rows = []
+        print(f"\n{'tau':>6}{'events':>9}{'full-det signals':>19}"
+              f"{'best mean dt':>14}{'top signal':>26}")
+        print("-" * 74)
+        for tau in args.tau_sweep:
+            if args.mode == "task":
+                raw = find_t_forget(metrics, args.num_tasks, rpt, tau=tau)
+                ev = {t: ((t + 1) * rpt, tf) for t, tf in raw.items()}
+            else:
+                ev = find_class_events(metrics, args.logs, rpt, tau=tau)
+            if not ev:
+                print(f"{tau:>6.2f}{0:>9}{'-':>19}{'-':>14}{'-':>26}")
+                continue
+            _, summ = score_signals(signals, ev, baseline_rounds, rpt,
+                                    z_k=Z_K, collect_table=False)
+            full = [s for s in summ if s["det_rate"] >= 0.999]
+            best = max(summ, key=lambda s: (s["det_rate"],
+                                            s["mean_dt"] if s["mean_dt"] == s["mean_dt"] else -99))
+            for s in summ:
+                tau_rows.append([f"{tau:g}", len(ev), s["signal"],
+                                 f"{s['det_rate']:.3f}",
+                                 (f"{s['mean_dt']:.2f}"
+                                  if s["mean_dt"] == s["mean_dt"] else ""),
+                                 s["false_alarms"]])
+            bd = (f"{best['mean_dt']:.2f}"
+                  if best["mean_dt"] == best["mean_dt"] else "-")
+            print(f"{tau:>6.2f}{len(ev):>9}{len(full):>19}{bd:>14}"
+                  f"{best['signal']:>26}")
+        tau_path = os.path.splitext(args.out)[0] + "_tau.csv"
+        with open(tau_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["tau", "n_events", "signal", "det_rate",
+                        "mean_dt", "false_alarms"])
+            w.writerows(tau_rows)
+        print(f"\nTau sweep written to {tau_path}")
+        print("A ranking that changes with tau is an artefact of the event "
+              "definition, not a property of the signals.")
 
     # threshold sweep: detection-rate vs earliness frontier per signal
     if args.sweep:

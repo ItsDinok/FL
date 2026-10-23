@@ -100,7 +100,6 @@ class SignalMonitor:
         self.probe_batches = probe_batches
         self.batch_size = batch_size
         self.anchors_per_task = anchors_per_task
-        self.device = next(model.parameters()).device
         self._rng = torch.Generator().manual_seed(seed)
         self._criterion = nn.CrossEntropyLoss()
 
@@ -125,6 +124,12 @@ class SignalMonitor:
         for name, idx in PROBE_LAYERS.items():
             enc.layers[idx].register_forward_hook(self._make_hook(name))
         enc.ln.register_forward_hook(self._make_hook("final"))
+
+    @property
+    def device(self):
+        """Dynamic: follows the model between CPU (parked, waiting for a
+        GPU slot) and GPU (active). Must not be cached at init."""
+        return next(self.model.parameters()).device
 
     def _make_hook(self, name):
         def hook(_m, _i, out):
@@ -339,3 +344,4 @@ class SignalMonitor:
                 out[f"cka_{k}"] = sum(vs) / len(vs)
         out["t_repr_ms"] = (time.perf_counter() - t0) * 1000
         return out
+

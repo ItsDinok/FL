@@ -21,8 +21,11 @@ most accurately predict forgetting".
 """
 
 import argparse
+import contextlib
 import csv
+import fcntl
 import os
+import time
 from collections import OrderedDict
 
 import flwr as fl
@@ -36,7 +39,7 @@ from preflight import SignalMonitor, SIGNAL_COLUMNS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NUM_CLIENTS = 3
+NUM_CLIENTS = 10
 LOCAL_EPOCHS = 2
 LEARNING_RATE = 1e-4
 ROUNDS_PER_BLOCK = 5           # keep in sync with server.py
@@ -44,11 +47,51 @@ NUM_BLOCKS = 4
 ALPHA = 0.5                    # Dirichlet concentration (K=100)
 METRICS_DIR = "logs"
 
+# ── GPU slot serialization ──────────────────────────────────────────────
+# With many clients on one GPU, only GPU_SLOTS clients may occupy it at a
+# time; the rest wait with their model parked on CPU. VRAM usage is then
+# bounded by GPU_SLOTS x per-client footprint (+ one CUDA context per
+# process, ~0.5GB each, which persists regardless).
+GPU_SLOTS = 2
+# Per-GPU lock pool: clients pinned to different GPUs (via
+# CUDA_VISIBLE_DEVICES in the launcher) contend only with clients on the
+# same card, so total concurrency = num_gpus x GPU_SLOTS.
+_LOCK_DIR = os.path.join(
+    METRICS_DIR,
+    ".gpu_slots_" + os.environ.get("CUDA_VISIBLE_DEVICES", "0").replace(",", "_"))
+
+
+@contextlib.contextmanager
+def gpu_slot(poll_s: float = 2.0):
+    """Acquire one of GPU_SLOTS exclusive slots (cross-process flock)."""
+    if DEVICE.type != "cuda":
+        yield
+        return
+    os.makedirs(_LOCK_DIR, exist_ok=True)
+    handle = None
+    while handle is None:
+        for i in range(GPU_SLOTS):
+            f = open(os.path.join(_LOCK_DIR, f"slot{i}.lock"), "w")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle = f
+                break
+            except OSError:
+                f.close()
+        if handle is None:
+            time.sleep(poll_s)
+    try:
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
 
 def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
+    """Built on CPU; moved to GPU only while holding a gpu_slot."""
     model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
     model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
-    return model.to(DEVICE)
+    return model
 
 
 def round_to_block(server_round: int) -> int:
@@ -148,37 +191,43 @@ class MigrationSignalClient(fl.client.NumPyClient):
         p = data.get_block_distribution(self.cid, self.alpha, block)
         dominant = CLASS_NAMES[int(p.argmax())]
         train_loader, _ = self._loaders(block)
-
-        # 1. pre-training signals
         planned = LOCAL_EPOCHS * len(train_loader)
-        sig = self.monitor.pre_training(train_loader, planned_steps=planned)
-        print(f"[client {self.cid}] r{server_round} block {block} "
-              f"dominant={dominant} new_loss={sig['new_loss']:.3f} "
-              f"grad_cos={sig['grad_cos']:.3f}", flush=True)
 
-        # 2. train
-        train(self.model, train_loader, epochs=LOCAL_EPOCHS,
-              lr=LEARNING_RATE)
+        with gpu_slot():
+            self.model.to(DEVICE)
 
-        # 3. post-training signals
-        sig = self.monitor.post_training(sig)
+            # 1. pre-training signals
+            sig = self.monitor.pre_training(train_loader,
+                                            planned_steps=planned)
+            print(f"[client {self.cid}] r{server_round} block {block} "
+                  f"dominant={dominant} new_loss={sig['new_loss']:.3f} "
+                  f"grad_cos={sig['grad_cos']:.3f}", flush=True)
 
-        # 4. log
+            # 2. train
+            train(self.model, train_loader, epochs=LOCAL_EPOCHS,
+                  lr=LEARNING_RATE)
+
+            # 3. post-training signals
+            sig = self.monitor.post_training(sig)
+
+            # 5a. snapshot needs the GPU (embeds anchors)
+            if server_round == 1 or is_block_final_round(server_round):
+                self.monitor.snapshot_task(block, train_loader.dataset)
+                print(f"[client {self.cid}] snapshot stored for block "
+                      f"{block} (round {server_round})", flush=True)
+
+            # park the model and release the slot
+            self.model.to("cpu")
+            torch.cuda.empty_cache()
+
+        # 4. log (no GPU needed)
         with open(self.signals_csv, "a", newline="") as f:
             csv.writer(f).writerow(
                 [server_round, block, dominant]
                 + [f"{sig[k]:.6f}" for k in SIGNAL_COLUMNS])
 
-        # 5. lifecycle
+        # 5b. buffer add is CPU-only
         self.monitor.add_to_buffer(train_loader.dataset, n=128)
-        # Snapshot at end of round 1 (early reference so representation
-        # signals have values in the calibration window, rounds 2-5) and
-        # at every block-final round (overwrites the early reference for
-        # block 0 with the state that actually solved it).
-        if server_round == 1 or is_block_final_round(server_round):
-            self.monitor.snapshot_task(block, train_loader.dataset)
-            print(f"[client {self.cid}] snapshot stored for block {block} "
-                  f"(round {server_round})", flush=True)
 
         fit_metrics = {f"c{self.cid}_block": block}
         for k in ("new_loss", "grad_cos", "pred_dL_old", "proto_drift",
@@ -199,12 +248,16 @@ class MigrationSignalClient(fl.client.NumPyClient):
         dominant = CLASS_NAMES[int(p.argmax())]
 
         per_class, total_loss, total_n = {}, 0.0, 0
-        for c, loader in self.eval_loaders.items():
-            loss, acc = evaluate_loader(self.model, loader)
-            per_class[c] = float(acc)
-            n = len(loader.dataset)
-            total_loss += loss * n
-            total_n += n
+        with gpu_slot():
+            self.model.to(DEVICE)
+            for c, loader in self.eval_loaders.items():
+                loss, acc = evaluate_loader(self.model, loader)
+                per_class[c] = float(acc)
+                n = len(loader.dataset)
+                total_loss += loss * n
+                total_n += n
+            self.model.to("cpu")
+            torch.cuda.empty_cache()
         mean_loss = total_loss / total_n
         mean_acc = sum(per_class.values()) / NUM_CLASSES
 

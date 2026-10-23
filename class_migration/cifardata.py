@@ -46,7 +46,7 @@ CLASS_NAMES = [
 ]
 assert len(CLASS_NAMES) == NUM_CLASSES
 
-SAMPLES_PER_CLIENT_PER_BLOCK = 5000
+SAMPLES_PER_CLIENT_PER_BLOCK = 2000   # reduced for 10-client runs
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -113,7 +113,7 @@ def load_dirichlet_partition(cid: int, num_clients: int,
     return _make_loader(tr, True, batch_size), _make_loader(va, False, batch_size)
 
 
-def load_per_class_eval_loaders(samples_per_class: int = 50,
+def load_per_class_eval_loaders(samples_per_class: int = 25,
                                 batch_size: int = BATCH_SIZE) -> dict:
     """One loader per class from the test set — per-class retained
     accuracy defines the per-class t_forget in horizon.py --mode class."""
