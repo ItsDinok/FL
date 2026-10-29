@@ -1,23 +1,24 @@
 """
-client.py — class-migration (Dirichlet) client with the FULL
-intervention-signal benchmark wired in.
+client.py — generic federated continual-learning client.
 
-This is the pre-feedback Dirichlet experiment instrumented with every
-signal family from preflight.py, so signal accuracy can be compared on the
-absence-driven forgetting regime:
+Dataset- and scenario-agnostic: everything that varies comes from
+config.py, datasets.py and scenarios.py, so a new dataset or scenario
+requires no change here.
 
-  per round:  pre-training signals -> train -> post-training signals
-  per block:  end-of-block snapshot (anchors, prototypes, weights)
-  logs:       metrics_client{cid}.csv       per-class retained accuracy
-              distribution_client{cid}.csv  Dirichlet proportions per block
-              signals_client{cid}.csv       all signals + per-group cost
+    python client.py --dataset cifar100 --scenario split --cid 0
+    python client.py --dataset pacs --scenario domain --cid 0 \
+                     --intra-round-eval
 
-Scoring afterwards (offline):
-  python horizon.py --logs logs/ --mode class
-which computes per-class t_forget (with per-class effective task-end
-windows from the distribution CSV), t_signal per signal, delta-t,
-detection rate, false alarms, and cost — i.e. exactly "which signals
-most accurately predict forgetting".
+Per round each client:
+  1. computes pre-training signals (gradient + predictive families)
+  2. trains locally, optionally probing retained accuracy mid-round
+  3. computes post-training signals (performance, weight-space,
+     representation)
+  4. writes signals, metrics and (optionally) step-level accuracy to CSV
+  5. snapshots anchors at round 1 and at each block's final round
+
+Scoring afterwards:
+    python horizon.py --logs <logs dir> --mode <task|class> --sweep
 """
 
 import argparse
@@ -31,47 +32,26 @@ from collections import OrderedDict
 import flwr as fl
 import torch
 import torch.nn as nn
-from torchvision.models import vit_b_16, ViT_B_16_Weights
 
-import cifardata as data
-from cifardata import NUM_CLASSES, CLASS_NAMES
+import config
 from preflight import SignalMonitor, SIGNAL_COLUMNS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NUM_CLIENTS = 10
-LOCAL_EPOCHS = 2
-LEARNING_RATE = 1e-4
-ROUNDS_PER_BLOCK = 5           # keep in sync with server.py
-NUM_BLOCKS = 4
-ALPHA = 0.5                    # Dirichlet concentration (K=100)
-METRICS_DIR = "logs"
 
-# ── GPU slot serialization ──────────────────────────────────────────────
-# With many clients on one GPU, only GPU_SLOTS clients may occupy it at a
-# time; the rest wait with their model parked on CPU. VRAM usage is then
-# bounded by GPU_SLOTS x per-client footprint (+ one CUDA context per
-# process, ~0.5GB each, which persists regardless).
-GPU_SLOTS = 2
-# Per-GPU lock pool: clients pinned to different GPUs (via
-# CUDA_VISIBLE_DEVICES in the launcher) contend only with clients on the
-# same card, so total concurrency = num_gpus x GPU_SLOTS.
-_LOCK_DIR = os.path.join(
-    METRICS_DIR,
-    ".gpu_slots_" + os.environ.get("CUDA_VISIBLE_DEVICES", "0").replace(",", "_"))
-
-
+# ── GPU slot serialisation (per GPU) ────────────────────────────────────
 @contextlib.contextmanager
-def gpu_slot(poll_s: float = 2.0):
-    """Acquire one of GPU_SLOTS exclusive slots (cross-process flock)."""
+def gpu_slot(lock_dir, slots, poll_s=2.0):
+    """Bound the number of clients holding GPU memory at once. Waiting
+    clients keep their model parked on the CPU."""
     if DEVICE.type != "cuda":
         yield
         return
-    os.makedirs(_LOCK_DIR, exist_ok=True)
+    os.makedirs(lock_dir, exist_ok=True)
     handle = None
     while handle is None:
-        for i in range(GPU_SLOTS):
-            f = open(os.path.join(_LOCK_DIR, f"slot{i}.lock"), "w")
+        for i in range(slots):
+            f = open(os.path.join(lock_dir, f"slot{i}.lock"), "w")
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 handle = f
@@ -87,32 +67,29 @@ def gpu_slot(poll_s: float = 2.0):
         handle.close()
 
 
-def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
-    """Built on CPU; moved to GPU only while holding a gpu_slot."""
-    model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
-    model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
-    return model
-
-
-def round_to_block(server_round: int) -> int:
-    return min((server_round - 1) // ROUNDS_PER_BLOCK, NUM_BLOCKS - 1)
-
-
-def is_block_final_round(server_round: int) -> bool:
-    return server_round % ROUNDS_PER_BLOCK == 0
-
-
-def train(model, loader, epochs: int, lr: float):
+def train(model, loader, epochs, lr, probe=None, probe_every=50):
+    """probe(step) fires at step 0 — before any update of this round —
+    and every probe_every optimiser steps thereafter."""
     model.train()
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    step = 0
+    if probe is not None:
+        probe(0)
+        model.train()
     for _ in range(epochs):
         for images, labels in loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            loss = criterion(model(images), labels)
-            loss.backward()
+            criterion(model(images), labels).backward()
             optimizer.step()
+            step += 1
+            if probe is not None and step % probe_every == 0:
+                probe(step)
+                model.train()
+    if probe is not None and step % probe_every != 0:
+        probe(step)
+        model.train()
 
 
 def evaluate_loader(model, loader):
@@ -126,56 +103,83 @@ def evaluate_loader(model, loader):
             loss += criterion(out, labels).item() * labels.size(0)
             correct += (out.argmax(1) == labels).sum().item()
             total += labels.size(0)
-    return loss / total, correct / total
+    return loss / max(total, 1), correct / max(total, 1)
 
 
-class MigrationSignalClient(fl.client.NumPyClient):
-    def __init__(self, cid: int, alpha: float):
-        self.cid = cid
-        self.alpha = alpha
-        self.model = build_model()
-        self.monitor = SignalMonitor(self.model, lr=LEARNING_RATE, seed=cid)
-        self._loader_cache = {}
-        self.eval_loaders = data.load_per_class_eval_loaders()
+class SignalClient(fl.client.NumPyClient):
+    def __init__(self, cid, args, scenario):
+        self.cid, self.args, self.sc = cid, args, scenario
+        self.model = config.build_model(args.model, scenario.num_classes)
+        self.monitor = SignalMonitor(
+            self.model, lr=args.lr, seed=cid,
+            param_filters=config.MODELS[args.model]["filters"])
+        self._cache = {}
+        self.units = scenario.eval_units()
+        self.unit_names = [scenario.unit_name(u) for u in self.units]
 
-        os.makedirs(METRICS_DIR, exist_ok=True)
+        self.dir = config.logs_dir(args)
+        os.makedirs(self.dir, exist_ok=True)
+        self.lock_dir = os.path.join(
+            self.dir, ".gpu_slots_"
+            + os.environ.get("CUDA_VISIBLE_DEVICES", "0").replace(",", "_"))
 
-        self.metrics_csv = os.path.join(METRICS_DIR,
-                                        f"metrics_client{cid}.csv")
-        if not os.path.exists(self.metrics_csv):
-            with open(self.metrics_csv, "w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["round", "block", "dominant_class", "loss"]
-                    + [f"acc_{n}" for n in CLASS_NAMES]
-                    + ["acc_mean"])
+        self.metrics_csv = self._init_csv(
+            f"metrics_client{cid}.csv",
+            ["round", "block", "loss"]
+            + [f"acc_{n}" for n in self.unit_names] + ["acc_mean"])
+        self.signals_csv = self._init_csv(
+            f"signals_client{cid}.csv",
+            ["round", "block", "gated"] + SIGNAL_COLUMNS)
+        # class-migration scoring needs the per-block class proportions:
+        # horizon.py --mode class derives each class's effective task end
+        # from them. Deterministic, so written once at startup.
+        if hasattr(scenario, "distribution"):
+            path = os.path.join(self.dir, f"distribution_client{cid}.csv")
+            if not os.path.exists(path):
+                with open(path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["block"] + [f"p_{n}" for n in self.unit_names])
+                    for b in range(scenario.num_blocks):
+                        p = scenario.distribution(cid, b)
+                        w.writerow([b] + [f"{v:.6f}" for v in p])
 
-        # Dirichlet proportions per block -> the effective task-end
-        # windows for horizon.py --mode class
-        self.dist_csv = os.path.join(METRICS_DIR,
-                                     f"distribution_client{cid}.csv")
-        if not os.path.exists(self.dist_csv):
-            with open(self.dist_csv, "w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["block"] + [f"p_{n}" for n in CLASS_NAMES])
-                for b in range(NUM_BLOCKS):
-                    p = data.get_block_distribution(cid, alpha, b)
-                    csv.writer(f).writerow(
-                        [b] + [f"{v:.6f}" for v in p])
+        self.steps_csv = self._init_csv(
+            f"steps_client{cid}.csv",
+            ["round", "block", "step", "global_step"]
+            + [f"acc_{n}" for n in self.unit_names] + ["acc_mean"]
+        ) if args.intra_round_eval else None
 
-        self.signals_csv = os.path.join(METRICS_DIR,
-                                        f"signals_client{cid}.csv")
-        if not os.path.exists(self.signals_csv):
-            with open(self.signals_csv, "w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["round", "block", "dominant_class"] + SIGNAL_COLUMNS)
+        # smaller probe set for intra-round evaluation
+        self.probe_units = {}
+        if args.intra_round_eval:
+            from torch.utils.data import DataLoader, Subset
+            for u, ld in self.units.items():
+                n = min(args.probe_images, len(ld.dataset))
+                self.probe_units[u] = DataLoader(
+                    Subset(ld.dataset, list(range(n))),
+                    batch_size=args.batch_size)
+
+    def _init_csv(self, name, header):
+        path = os.path.join(self.dir, name)
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(header)
+        return path
+
+    def _round_to_block(self, r):
+        return min((r - 1) // self.args.rounds_per_block,
+                   self.sc.num_blocks - 1)
+
+    def _is_block_end(self, r):
+        return r % self.args.rounds_per_block == 0
 
     def _loaders(self, block):
-        if block not in self._loader_cache:
-            self._loader_cache[block] = data.load_dirichlet_partition(
-                self.cid, NUM_CLIENTS, self.alpha, block)
-        return self._loader_cache[block]
+        if block not in self._cache:
+            self._cache[block] = self.sc.partition(
+                self.cid, self.args.clients, block)
+        return self._cache[block]
 
-    def get_parameters(self, config):
+    def get_parameters(self, config_):
         return [v.cpu().numpy() for v in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
@@ -184,102 +188,105 @@ class MigrationSignalClient(fl.client.NumPyClient):
             {k: torch.tensor(v) for k, v in zip(keys, parameters)}),
             strict=True)
 
-    def fit(self, parameters, config):
+    def fit(self, parameters, config_):
         self.set_parameters(parameters)
-        server_round = int(config.get("server_round", 1))
-        block = round_to_block(server_round)
-        p = data.get_block_distribution(self.cid, self.alpha, block)
-        dominant = CLASS_NAMES[int(p.argmax())]
+        rnd = int(config_.get("server_round", 1))
+        block = self._round_to_block(rnd)
         train_loader, _ = self._loaders(block)
-        planned = LOCAL_EPOCHS * len(train_loader)
+        a = self.args
 
-        with gpu_slot():
+        with gpu_slot(self.lock_dir, a.gpu_slots):
             self.model.to(DEVICE)
+            steps = a.local_epochs * len(train_loader)
+            sig = self.monitor.pre_training(train_loader, planned_steps=steps)
 
-            # 1. pre-training signals
-            sig = self.monitor.pre_training(train_loader,
-                                            planned_steps=planned)
-            print(f"[client {self.cid}] r{server_round} block {block} "
-                  f"dominant={dominant} new_loss={sig['new_loss']:.3f} "
-                  f"grad_cos={sig['grad_cos']:.3f}", flush=True)
+            lr, gated = a.lr, 0
+            if a.controller:
+                v = sig.get(a.gate_signal, float("nan"))
+                if v == v and v > a.gate_threshold:
+                    lr, gated = a.lr * a.gate_lr_scale, 1
+            print(f"[c{self.cid}] r{rnd} block {block} "
+                  f"({self.sc.block_name(block)}) "
+                  f"new_loss={sig['new_loss']:.3f} gated={gated}", flush=True)
 
-            # 2. train
-            train(self.model, train_loader, epochs=LOCAL_EPOCHS,
-                  lr=LEARNING_RATE)
+            probe = None
+            if a.intra_round_eval:
+                def probe(step):
+                    accs = [evaluate_loader(self.model, ld)[1]
+                            for ld in self.probe_units.values()]
+                    with open(self.steps_csv, "a", newline="") as f:
+                        csv.writer(f).writerow(
+                            [rnd, block, step, (rnd - 1) * steps + step]
+                            + [f"{x:.4f}" for x in accs]
+                            + [f"{sum(accs) / len(accs):.4f}"])
 
-            # 3. post-training signals
+            train(self.model, train_loader, a.local_epochs, lr,
+                  probe=probe, probe_every=a.probe_every_steps)
+
             sig = self.monitor.post_training(sig)
-
-            # 5a. snapshot needs the GPU (embeds anchors)
-            if server_round == 1 or is_block_final_round(server_round):
+            if rnd == 1 or self._is_block_end(rnd):
                 self.monitor.snapshot_task(block, train_loader.dataset)
-                print(f"[client {self.cid}] snapshot stored for block "
-                      f"{block} (round {server_round})", flush=True)
+                print(f"[c{self.cid}] snapshot: block {block} (r{rnd})",
+                      flush=True)
 
-            # park the model and release the slot
             self.model.to("cpu")
             torch.cuda.empty_cache()
 
-        # 4. log (no GPU needed)
         with open(self.signals_csv, "a", newline="") as f:
-            csv.writer(f).writerow(
-                [server_round, block, dominant]
-                + [f"{sig[k]:.6f}" for k in SIGNAL_COLUMNS])
-
-        # 5b. buffer add is CPU-only
+            csv.writer(f).writerow([rnd, block, gated]
+                                   + [f"{sig[k]:.6f}" for k in SIGNAL_COLUMNS])
         self.monitor.add_to_buffer(train_loader.dataset, n=128)
 
-        fit_metrics = {f"c{self.cid}_block": block}
-        for k in ("new_loss", "grad_cos", "pred_dL_old", "proto_drift",
-                  "weight_div_task", "cka_final", "ref_acc"):
-            v = sig[k]
-            if v == v:
-                fit_metrics[f"c{self.cid}_{k}"] = float(v)
-        return (self.get_parameters(config={}),
-                len(train_loader.dataset), fit_metrics)
+        m = {f"c{self.cid}_block": block, f"c{self.cid}_gated": gated}
+        for k in ("new_loss", "grad_cos", "pred_dL_old", "ref_acc",
+                  "weight_div_round", "centroid_drift", "cka_final"):
+            if sig[k] == sig[k]:
+                m[f"c{self.cid}_{k}"] = float(sig[k])
+        return self.get_parameters({}), len(train_loader.dataset), m
 
-    def evaluate(self, parameters, config):
-        """Per-class retained accuracy — ground truth for per-class
-        t_forget in horizon.py --mode class."""
+    def evaluate(self, parameters, config_):
         self.set_parameters(parameters)
-        server_round = int(config.get("server_round", 0))
-        block = round_to_block(server_round) if server_round else 0
-        p = data.get_block_distribution(self.cid, self.alpha, block)
-        dominant = CLASS_NAMES[int(p.argmax())]
+        rnd = int(config_.get("server_round", 0))
+        block = self._round_to_block(rnd) if rnd else 0
 
-        per_class, total_loss, total_n = {}, 0.0, 0
-        with gpu_slot():
+        per_unit, tot_loss, tot_n = {}, 0.0, 0
+        with gpu_slot(self.lock_dir, self.args.gpu_slots):
             self.model.to(DEVICE)
-            for c, loader in self.eval_loaders.items():
-                loss, acc = evaluate_loader(self.model, loader)
-                per_class[c] = float(acc)
-                n = len(loader.dataset)
-                total_loss += loss * n
-                total_n += n
+            for u, ld in self.units.items():
+                loss, acc = evaluate_loader(self.model, ld)
+                per_unit[u] = acc
+                n = len(ld.dataset)
+                tot_loss += loss * n
+                tot_n += n
             self.model.to("cpu")
             torch.cuda.empty_cache()
-        mean_loss = total_loss / total_n
-        mean_acc = sum(per_class.values()) / NUM_CLASSES
 
-        metrics = {f"c{self.cid}_acc_mean": float(mean_acc),
-                   "accuracy": float(mean_acc)}
-
+        mean_acc = sum(per_unit.values()) / len(per_unit)
         with open(self.metrics_csv, "a", newline="") as f:
             csv.writer(f).writerow(
-                [server_round, block, dominant, f"{mean_loss:.4f}"]
-                + [f"{per_class[c]:.4f}" for c in range(NUM_CLASSES)]
+                [rnd, block, f"{tot_loss / tot_n:.4f}"]
+                + [f"{per_unit[u]:.4f}" for u in self.units]
                 + [f"{mean_acc:.4f}"])
-        return float(mean_loss), total_n, metrics
+
+        metrics = {f"c{self.cid}_acc_{self.sc.unit_name(u)}": a
+                   for u, a in per_unit.items()}
+        metrics[f"c{self.cid}_acc_mean"] = float(mean_acc)
+        metrics["accuracy"] = float(mean_acc)
+        return float(tot_loss / tot_n), tot_n, metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cid", type=int, required=True)
-    parser.add_argument("--server", type=str, default="127.0.0.1:8080")
-    parser.add_argument("--alpha", type=float, default=ALPHA)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--cid", type=int, required=True)
+    ap.add_argument("--server", default=None)
+    config.add_arguments(ap)
+    args = ap.parse_args()
+
+    sc = config.make_scenario(args)
+    if args.cid == 0:
+        print(config.summarise(args, sc), flush=True)
 
     fl.client.start_client(
-        server_address=args.server,
-        client=MigrationSignalClient(args.cid, args.alpha).to_client(),
+        server_address=args.server or f"127.0.0.1:{args.port}",
+        client=SignalClient(args.cid, args, sc).to_client(),
     )

@@ -1,0 +1,4 @@
+  File "/var/spool/slurm/d/job27886/slurm_script", line 3
+    python write_distributions.py --logs logs/pathmnist_dirichlet_path_diri \
+           ^
+SyntaxError: invalid syntax

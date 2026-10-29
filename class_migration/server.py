@@ -1,28 +1,29 @@
 """
-server.py — server for the instrumented class-migration
-(Dirichlet CIFAR-100) signal experiment.
+server.py — generic federated continual-learning server.
+
+Reads the same configuration as the client, so the two cannot disagree
+about client count or block schedule.
+
+    python server.py --dataset cifar100 --scenario split
+    python server.py --dataset pacs --scenario domain --port 8081
+
+Broadcasts the round number (which drives every client's block schedule)
+and aggregates whatever per-client metrics arrive, including the
+per-client signal values used for cross-checking.
 """
+
+import argparse
 
 import flwr as fl
 from flwr.common import ndarrays_to_parameters
 
-from client import (build_model, ROUNDS_PER_BLOCK, NUM_BLOCKS,
-                              NUM_CLIENTS, ALPHA)
-from cifardata import CLASS_NAMES, get_block_distribution
-
-NUM_ROUNDS = ROUNDS_PER_BLOCK * NUM_BLOCKS
-MIN_CLIENTS = NUM_CLIENTS
-
-
-def fit_config(server_round: int):
-    return {"server_round": server_round}
-
-
-def evaluate_config(server_round: int):
-    return {"server_round": server_round}
+import config
 
 
 def weighted_average(metrics):
+    """Per-key weighted mean over the clients that reported that key, so
+    per-client keys (c0_*, c1_*) pass through untouched while shared keys
+    ('accuracy') average across the fleet."""
     sums, counts = {}, {}
     for n, m in metrics:
         for k, v in m.items():
@@ -31,37 +32,39 @@ def weighted_average(metrics):
     return {k: sums[k] / counts[k] for k in sorted(sums)}
 
 
-def get_initial_parameters():
-    model = build_model()
-    return ndarrays_to_parameters(
-        [v.cpu().numpy() for v in model.state_dict().values()])
-
-
 def main():
-    print(f"Class-migration signal experiment  alpha={ALPHA}  "
-          f"{NUM_BLOCKS} blocks x {ROUNDS_PER_BLOCK} rounds")
-    for cid in range(NUM_CLIENTS):
-        row = []
-        for b in range(NUM_BLOCKS):
-            p = get_block_distribution(cid, ALPHA, b)
-            row.append(f"b{b}:{CLASS_NAMES[int(p.argmax())]}({p.max():.2f})")
-        print(f"  client {cid}: " + "  ".join(row))
+    ap = argparse.ArgumentParser(description=__doc__)
+    config.add_arguments(ap)
+    args = ap.parse_args()
+
+    sc = config.make_scenario(args)
+    rounds = args.rounds_per_block * sc.num_blocks
+
+    print("Federated continual-learning benchmark")
+    print(config.summarise(args, sc))
+    print(f"\nScore afterwards with:\n  python horizon.py --logs "
+          f"{config.logs_dir(args)} --mode {sc.unit_mode} --sweep\n",
+          flush=True)
+
+    model = config.build_model(args.model, sc.num_classes)
+    initial = ndarrays_to_parameters(
+        [v.cpu().numpy() for v in model.state_dict().values()])
 
     strategy = fl.server.strategy.FedAvg(
         fraction_fit=1.0,
         fraction_evaluate=1.0,
-        min_fit_clients=MIN_CLIENTS,
-        min_evaluate_clients=MIN_CLIENTS,
-        min_available_clients=MIN_CLIENTS,
-        initial_parameters=get_initial_parameters(),
-        on_fit_config_fn=fit_config,
-        on_evaluate_config_fn=evaluate_config,
+        min_fit_clients=args.clients,
+        min_evaluate_clients=args.clients,
+        min_available_clients=args.clients,
+        initial_parameters=initial,
+        on_fit_config_fn=lambda r: {"server_round": r},
+        on_evaluate_config_fn=lambda r: {"server_round": r},
         evaluate_metrics_aggregation_fn=weighted_average,
         fit_metrics_aggregation_fn=weighted_average,
     )
     fl.server.start_server(
-        server_address="0.0.0.0:8080",
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
+        server_address=f"0.0.0.0:{args.port}",
+        config=fl.server.ServerConfig(num_rounds=rounds),
         strategy=strategy,
     )
 

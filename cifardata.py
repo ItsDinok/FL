@@ -29,6 +29,7 @@ Evaluation:
     task index, and the block schedule is identical.)
 """
 
+import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset, random_split
@@ -149,7 +150,43 @@ def load_domain_eval_loaders(samples: int = 1000,
     return loaders
 
 
+def ensure_data(data_dir: str = None) -> str:
+    """
+        Download and verify CIFAR-100 if it is not already present
+        Running this before a federated job means clients won't burn through memory reacquiring data
+    """
+    import shutil
+
+    target = data_dir or DATA_DIR
+    os.makedirs(target, exist_ok=True)
+    print(f"Data directory: {os.path.abspath(target)}")
+    free_gb = shutil.disk_usage(target).free / 1e9
+    if free_gb < 1.0:
+        print(f"Warning: only {free_gb:.1f} GB free; CIFAR-100 needs 0.2GB")
+
+        for split, train in (("train", True), ("test", False)):
+            ds = CIFAR100(target, train=train, download=True)
+            print(f"  {split}: {len(ds)} images, {len(ds.classes)} classes")
+            print("CIFAR-100 ready.")
+            return target
+
+
 if __name__ == "__main__":
+    import argparse    
+
+    _ap = argparse.ArgumentParser(description=__doc__)
+    _ap.add_argument("--download", action="store_true",
+        help="download/verify CIFAR100 and exit")
+    _ap.add_argument("--data-dir", default=None,
+        help=f"override DATA_DIR (default{DATA_DIR})")
+    _args = _ap.parse_args()
+
+    if _args.data_dir:
+        DATA_DIR = _args.data_dir
+    ensure_data(DATA_DIR)
+    if _args.download:
+        raise SystemExit(0)
+
     print(f"Domain-incremental CIFAR-100: {NUM_DOMAINS} domains")
     for d, name in enumerate(DOMAIN_NAMES):
         print(f"  domain {d}: {name}")
