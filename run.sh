@@ -13,7 +13,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --container-image=/home/users/mdevine/FL/itsdinok+fl-experiment+latest.sqsh
-#SBATCH --container-mounts=/home/users/mdevine/FL/class_migration:/workspace:rw
+#SBATCH --container-mounts=/home/users/mdevine/FL:/workspace:rw
 #SBATCH --container-workdir=/workspace
 
 # One experiment per submission. Everything is passed through, so no file
